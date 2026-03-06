@@ -8,22 +8,62 @@ A tool for analyzing Chrome DevTools performance trace files to identify perform
 node index.js ./example-trace.json
 ```
 
-Or with a custom top-N limit (default is 30):
+With a custom top-N limit (default is 30):
 
 ```bash
 node index.js ./example-trace.json 50
+```
+
+Restrict analysis to the main renderer thread only:
+
+```bash
+node index.js ./example-trace.json --main-thread-only
+```
+
+Restrict analysis to a specific thread by ID:
+
+```bash
+node index.js ./example-trace.json --tid 12345
+```
+
+Flags and positional arguments can be combined in any order:
+
+```bash
+node index.js ./example-trace.json 20 --main-thread-only
 ```
 
 ## What it does
 
 This tool parses Chrome performance trace JSON files and provides:
 
-- **Top trace events by CPU time** - Shows which browser operations consumed the most time
+- **Top trace events by CPU time** - Shows which browser operations consumed the most time, with count, total, self, and max duration columns
 - **Top JS call frames / URLs** - Identifies the JavaScript functions and URLs with highest execution time
 - **Top categories** - Groups events by their trace categories
 - **Scroll / rendering related events** - Filters events that may impact scroll performance
 - **Important rendering buckets** - Key metrics for layout, paint, and composite operations
 - **Heuristic hints** - Automated suggestions for common performance issues
+
+### Self-time vs total time
+
+Each report table shows four columns per entry:
+
+| Column | Description |
+|--------|-------------|
+| `count` | Number of times the event occurred |
+| `total ms` | Sum of each event's full duration, including time spent in nested child events |
+| `self ms` | Sum of time spent *inside* the event, excluding time delegated to nested children |
+| `max ms` | Longest single occurrence of the event |
+
+Self-time is computed per-thread using a stack-based algorithm that handles arbitrarily nested `X` (complete) events.
+
+### Thread filtering
+
+| Flag | Description |
+|------|-------------|
+| `--main-thread-only` | Include only events from the thread named `CrRendererMain` or `main` (the browser's main renderer thread) |
+| `--tid <n>` | Include only events from thread with the given numeric ID |
+
+If `--main-thread-only` is specified but no `CrRendererMain`/`main` thread is found in the trace, a warning is printed and all threads are shown.
 
 ## Generating a trace file
 
@@ -36,14 +76,18 @@ This tool parses Chrome performance trace JSON files and provides:
 
 ## Example output
 
+The `self ms` column shows time spent *inside* the event excluding child events,
+which is often the most actionable metric (e.g. `RunTask` total is high but most
+of that time is attributed to `FunctionCall` children, not `RunTask` itself).
+
 ```
 === Top trace events by CPU time ===
-  10481.49 ms  RunTask
-   6452.81 ms  v8::Debugger::AsyncTaskRun
-   3238.99 ms  v8.callFunction
-   3235.56 ms  FunctionCall
-   3227.56 ms  PageAnimator::serviceScriptedAnimations
-   ...
+  count    total ms     self ms      max ms  name
+      1    10481.49 ms     4200.13 ms    10481.49 ms  RunTask
+      2     6452.81 ms     6452.81 ms     3301.50 ms  v8::Debugger::AsyncTaskRun
+      1     3238.99 ms     3238.99 ms     3238.99 ms  v8.callFunction
+      3     3235.56 ms      802.11 ms     1420.33 ms  FunctionCall
+    ...
 
 === Heuristic hints ===
 - Heavy JS/event-handler cost. In Angular this often means scroll listeners,
