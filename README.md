@@ -23,7 +23,14 @@ This tool parses Chrome performance trace JSON files and provides:
 - **Top categories** - Groups events by their trace categories
 - **Scroll / rendering related events** - Filters events that may impact scroll performance
 - **Important rendering buckets** - Key metrics for layout, paint, and composite operations
-- **Heuristic hints** - Automated suggestions for common performance issues
+- **Angular heuristics** - Automated Angular-specific suggestions including:
+  - zone.js detection from sampled call frames
+  - EventDispatch → FunctionCall ratio analysis
+  - Suggestions for `NgZone.runOutsideAngular()`, `ChangeDetectionStrategy.OnPush`, RxJS throttling, and CDK virtual scrolling
+- **Layout thrash hints** - Layout-thrashing detection including:
+  - Frequency-based Layout / RecalculateStyles spike detection
+  - Forced-reflow call-site identification (reads of `getBoundingClientRect`, `offsetHeight`, `scrollTop`, etc.)
+  - Recommendations for DOM read/write batching and `requestAnimationFrame` scheduling
 
 ## Generating a trace file
 
@@ -45,12 +52,30 @@ This tool parses Chrome performance trace JSON files and provides:
    3227.56 ms  PageAnimator::serviceScriptedAnimations
    ...
 
-=== Heuristic hints ===
-- Heavy JS/event-handler cost. In Angular this often means scroll listeners,
-  zone.js-triggered change detection, or repeated component work.
-- Layout/style cost is significant. Look for forced reflow,
-  getBoundingClientRect/offsetHeight/clientHeight reads after DOM writes,
-  sticky/fixed elements, or large DOM.
+=== Angular heuristics ===
+- zone.js detected in call frames. Every async operation (setTimeout, Promises,
+  XHR, event listeners) triggers a full change-detection pass. Move work that
+  does not need UI updates outside Angular's zone with NgZone.runOutsideAngular().
+- EventDispatch → FunctionCall pattern: EventDispatch=  320.00 ms,
+  FunctionCall= 3235.56 ms (ratio 0.10). High EventDispatch cost means user/input
+  events are directly driving expensive JS.
+- Heavy JS/event-handler cost detected (FunctionCall > Layout).
+  Suggestions:
+  • Switch leaf components to ChangeDetectionStrategy.OnPush.
+  • Wrap read-heavy scroll/resize handlers with NgZone.runOutsideAngular().
+  • Throttle or debounce high-frequency event streams (RxJS throttleTime / debounceTime).
+  • Use CDK virtual scrolling (<cdk-virtual-scroll-viewport>) for long lists.
+
+=== Layout thrash hints ===
+- High layout/style-recalculation frequency detected: Layout×120, RecalculateStyles×118.
+  Suggestions:
+  • Batch all DOM reads first, then apply all DOM writes (e.g. use FastDOM).
+  • Replace synchronous reads like getBoundingClientRect() inside loops with values
+    cached before the loop.
+  • Use ResizeObserver instead of polling offsetWidth/offsetHeight.
+  • Schedule write-heavy work in requestAnimationFrame callbacks.
+- Likely forced-reflow call sites detected (property reads that flush layout):
+      450.00 ms  getBoundingClientRect @ https://example.com/app.js:200
 ```
 
 ## Use cases
