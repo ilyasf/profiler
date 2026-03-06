@@ -1,0 +1,100 @@
+{
+  "traceEvents": [
+    {
+      "ph": "X",
+      "name": "FunctionCall",
+      "cat": "devtools.timeline",
+      "ts": 1000,
+      "dur": 5000000,
+      "args": {
+        "data": {
+          "functionName": "handleScroll",
+          "url": "https://example.com/app.js",
+          "lineNumber": 42
+        }
+      }
+    },
+    {
+      "ph": "X",
+      "name": "Layout",
+      "cat": "devtools.timeline,blink",
+      "ts": 2000,
+      "dur": 2000000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "RecalculateStyles",
+      "cat": "devtools.timeline,blink",
+      "ts": 3000,
+      "dur": 1500000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "Paint",
+      "cat": "devtools.timeline,blink",
+      "ts": 4000,
+      "dur": 800000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "EventDispatch",
+      "cat": "devtools.timeline",
+      "ts": 5000,
+      "dur": 500000,
+      "args": {
+        "data": {
+          "type": "scroll"
+        }
+      }
+    },
+    {
+      "ph": "X",
+      "name": "CompositeLayers",
+      "cat": "devtools.timeline,blink",
+      "ts": 6000,
+      "dur": 200000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "FunctionCall",
+      "cat": "devtools.timeline",
+      "ts": 7000,
+      "dur": 3000000,
+      "args": {
+        "callFrame": {
+          "functionName": "detectChanges",
+          "url": "https://example.com/zone.js",
+          "lineNumber": 100
+        }
+      }
+    },
+    {
+      "ph": "X",
+      "name": "RunTask",
+      "cat": "toplevel",
+      "ts": 8000,
+      "dur": 1000000,
+      "args": {}
+    },
+    {
+      "ph": "B",
+      "name": "ShouldBeIgnored",
+      "cat": "devtools.timeline",
+      "ts": 9000,
+      "dur": 999000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "UpdateLayoutTree",
+      "cat": "devtools.timeline,blink",
+      "ts": 10000,
+      "dur": 750000,
+      "args": {}
+    }
+  ]
+}

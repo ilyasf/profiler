@@ -1,13 +1,16 @@
 {
   "name": "trace_debug",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "CLI tool for analyzing Chrome DevTools performance trace files",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "bin": {
+    "trace-debug": "./cli.js"
   },
-  "keywords": [],
+  "scripts": {
+    "start": "node cli.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "keywords": ["chrome", "trace", "performance", "profiler", "devtools"],
   "author": "",
   "license": "ISC",
   "type": "commonjs"
