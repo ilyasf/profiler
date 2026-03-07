@@ -104,3 +104,6 @@ of that time is attributed to `FunctionCall` children, not `RunTask` itself).
 - Finding layout thrashing and forced reflows
 - Analyzing paint and composite performance
 - Tracking down slow JavaScript execution
+
+## Example output
+<img width="859" height="883" alt="image" src="https://github.com/user-attachments/assets/e2be54b4-60fe-4d63-a89d-3ec17bef6530" />
