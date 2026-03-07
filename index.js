@@ -4,7 +4,7 @@
 
 const fs = require("fs");
 
-// ---------- Constants ----------
+// ── Constants ──────────────────────────────────────────────────────────────────
 
 const INTERESTING = [
   "EventDispatch",
@@ -22,12 +22,12 @@ const INTERESTING = [
 /** Chrome trace event names that carry per-frame timing information. */
 const FRAME_EVENT_NAMES = new Set(["DrawFrame", "BeginFrame", "ActivateLayerTree"]);
 
-// ---------- CLI argument parsing ----------
+// ── CLI argument parsing ──────────────────────────────────────────────────────
 
 /**
  * Parse process.argv-style argument list into a structured options object.
  * Supports:
- *   node index.js [--format text|json|csv] [--top N] <file>
+ *   node index.js [--format text|json|csv] [--top N] [--main-thread-only] [--tid N] <file>
  *   node index.js compare <file-a> <file-b> [--format text|json|csv] [--top N]
  *
  * For backward compatibility, a bare numeric second positional argument is
@@ -35,7 +35,14 @@ const FRAME_EVENT_NAMES = new Set(["DrawFrame", "BeginFrame", "ActivateLayerTree
  * invocation).
  */
 function parseArgs(argv) {
-  const args = { format: "text", top: 30, compare: false, files: [] };
+  const args = {
+    format: "text",
+    top: 30,
+    compare: false,
+    files: [],
+    mainThreadOnly: false,
+    filterTid: null,
+  };
   let i = 0;
   while (i < argv.length) {
     const arg = argv[i];
@@ -49,6 +56,10 @@ function parseArgs(argv) {
       args.top = Number(argv[++i]);
     } else if (arg.startsWith("--top=")) {
       args.top = Number(arg.slice("--top=".length));
+    } else if (arg === "--main-thread-only") {
+      args.mainThreadOnly = true;
+    } else if (arg === "--tid") {
+      args.filterTid = Number(argv[++i]);
     } else if (!arg.startsWith("-")) {
       args.files.push(arg);
     }
@@ -62,64 +73,134 @@ function parseArgs(argv) {
   return args;
 }
 
-// ---------- Shared helpers ----------
+// ── Stats helpers ─────────────────────────────────────────────────────────────
 
-function add(map, key, durMs) {
+function makeStats() {
+  return { count: 0, total: 0, self: 0, max: 0 };
+}
+
+/**
+ * Add a complete event's timing into a stats map.
+ * @param {Map} map
+ * @param {string} key
+ * @param {number} totalUs - total (wall) duration in microseconds
+ * @param {number} selfUs  - self (exclusive) duration in microseconds
+ */
+function addStats(map, key, totalUs, selfUs) {
   if (!key) return;
-  map.set(key, (map.get(key) || 0) + durMs);
+  const s = map.get(key) || makeStats();
+  s.count += 1;
+  s.total += totalUs;
+  s.self += selfUs;
+  if (totalUs > s.max) s.max = totalUs;
+  map.set(key, s);
 }
 
-function fmt(ms) {
-  return `${ms.toFixed(2).padStart(10)} ms`;
-}
-
-function topEntries(map, limit) {
-  return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
-}
-
-function loadTrace(file) {
-  if (!fs.existsSync(file)) {
-    console.error(`File not found: ${file}`);
-    process.exit(1);
-  }
-  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-  return Array.isArray(raw) ? raw : raw.traceEvents || [];
-}
-
-// ---------- Core analysis ----------
+// ── Core analysis ─────────────────────────────────────────────────────────────
 
 /**
  * Analyse an array of Chrome trace events and return structured results.
- * @param {object[]} events - Array of Chrome trace events.
- * @returns {object} Analysis result containing maps, rendering buckets, jank summary, and hints.
+ * @param {object[]} events - Raw Chrome trace event array.
+ * @param {object}   opts
+ * @param {boolean}  opts.mainThreadOnly - Restrict to CrRendererMain / main thread.
+ * @param {number|null} opts.filterTid  - Restrict to specific tid.
+ * @returns {object}
  */
-function analyzeTrace(events) {
+function analyzeTrace(events, { mainThreadOnly = false, filterTid = null } = {}) {
+  // ── Build thread name map (pid:tid → name) ──────────────────────────────────
+  const threadNames = new Map();
+  for (const e of events) {
+    if (e.ph === "M" && e.name === "thread_name") {
+      const key = `${e.pid}:${e.tid}`;
+      if (e.args && e.args.name) threadNames.set(key, e.args.name);
+    }
+  }
+
+  const mainThreadKeys = new Set(
+    [...threadNames.entries()]
+      .filter(([, name]) => name === "CrRendererMain" || name === "main")
+      .map(([key]) => key)
+  );
+
+  // ── Filter complete events (ph === "X") ────────────────────────────────────
+  function isIncluded(e) {
+    if (e.ph !== "X") return false;
+    if (filterTid !== null && e.tid !== filterTid) return false;
+    if (mainThreadOnly && mainThreadKeys.size > 0) {
+      if (!mainThreadKeys.has(`${e.pid}:${e.tid}`)) return false;
+    }
+    return true;
+  }
+
+  const completeEvents = events.filter(isIncluded);
+
+  // ── Self-time computation ──────────────────────────────────────────────────
+  // Group by pid:tid, then for each thread use a stack-based algorithm:
+  // self time = total duration − duration of direct children.
+  const byThread = new Map();
+  for (const e of completeEvents) {
+    const key = `${e.pid}:${e.tid}`;
+    if (!byThread.has(key)) byThread.set(key, []);
+    byThread.get(key).push(e);
+  }
+
+  const selfTimeMap = new Map(); // event object → self duration (µs)
+
+  for (const threadEvents of byThread.values()) {
+    // Sort by start timestamp asc; ties broken by duration desc so a parent
+    // (larger span) comes before a child that starts at the same µs.
+    threadEvents.sort((a, b) =>
+      a.ts !== b.ts ? a.ts - b.ts : (b.dur || 0) - (a.dur || 0)
+    );
+
+    for (const e of threadEvents) {
+      selfTimeMap.set(e, e.dur || 0);
+    }
+
+    const stack = []; // { end: number, event: object }
+    for (const e of threadEvents) {
+      const start = e.ts || 0;
+      const dur = e.dur || 0;
+
+      // Pop events that have already ended.
+      while (stack.length && stack[stack.length - 1].end <= start) {
+        stack.pop();
+      }
+
+      // Subtract this child's duration from the direct parent's self time.
+      if (stack.length) {
+        const parent = stack[stack.length - 1].event;
+        selfTimeMap.set(parent, Math.max(0, selfTimeMap.get(parent) - dur));
+      }
+
+      stack.push({ end: start + dur, event: e });
+    }
+  }
+
+  // ── Aggregate stats ────────────────────────────────────────────────────────
   const byEventName = new Map();
   const byCallFrame = new Map();
   const byCategory = new Map();
   const scrollRelated = new Map();
   const frameDurationsMs = [];
 
-  for (const e of events) {
-    // Chrome trace "complete event"
-    if (e.ph !== "X") continue;
-
-    const durMs = (e.dur || 0) / 1000;
+  for (const e of completeEvents) {
+    const totalUs = e.dur || 0;
+    const selfUs = selfTimeMap.get(e) ?? totalUs;
     const name = e.name || "(unnamed)";
     const cat = e.cat || "(no-category)";
     const args = e.args || {};
     const data = args.data || {};
     const beginData = args.beginData || {};
 
-    add(byEventName, name, durMs);
-    add(byCategory, cat, durMs);
+    addStats(byEventName, name, totalUs, selfUs);
+    addStats(byCategory, cat, totalUs, selfUs);
 
     // Try to extract JS function / frame info
     const frame =
       data.url || data.functionName || data.scriptName || beginData.url || beginData.frame;
 
     let frameLabel = null;
-
     if (data.functionName || data.url) {
       frameLabel = `${data.functionName || "(anonymous)"} @ ${data.url || data.scriptName || "(inline)"}`;
     } else if (args.callFrame) {
@@ -129,7 +210,7 @@ function analyzeTrace(events) {
       frameLabel = String(frame);
     }
 
-    if (frameLabel) add(byCallFrame, frameLabel, durMs);
+    if (frameLabel) addStats(byCallFrame, frameLabel, totalUs, selfUs);
 
     const lower =
       `${name} ${cat} ${JSON.stringify(args).slice(0, 1000)}`.toLowerCase();
@@ -145,27 +226,35 @@ function analyzeTrace(events) {
       lower.includes("recalculate") ||
       lower.includes("paint")
     ) {
-      add(scrollRelated, name, durMs);
+      addStats(scrollRelated, name, totalUs, selfUs);
     }
 
     // Collect per-frame timing
-    if (FRAME_EVENT_NAMES.has(name) && durMs > 0) {
-      frameDurationsMs.push(durMs);
+    if (FRAME_EVENT_NAMES.has(name) && totalUs > 0) {
+      frameDurationsMs.push(totalUs / 1000);
     }
   }
 
   const renderingBuckets = {};
   for (const key of INTERESTING) {
-    renderingBuckets[key] = byEventName.get(key) || 0;
+    renderingBuckets[key] = byEventName.get(key) || makeStats();
   }
 
   const jankSummary = computeJankSummary(frameDurationsMs);
   const heuristicHints = computeHints(renderingBuckets);
 
-  return { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints };
+  return {
+    byEventName,
+    byCallFrame,
+    byCategory,
+    scrollRelated,
+    renderingBuckets,
+    jankSummary,
+    heuristicHints,
+  };
 }
 
-// ---------- Jank summary ----------
+// ── Jank summary ──────────────────────────────────────────────────────────────
 
 /**
  * Compute jank statistics from an array of frame durations in milliseconds.
@@ -204,26 +293,27 @@ function computeJankSummary(frames) {
   };
 }
 
-// ---------- Heuristic hints ----------
+// ── Heuristic hints ───────────────────────────────────────────────────────────
 
-function computeHints({ EventDispatch, FunctionCall, Layout, RecalculateStyles, Paint }) {
+function computeHints(renderingBuckets) {
+  const getTotal = (key) => (renderingBuckets[key] || makeStats()).total;
   const hints = [];
-  if (EventDispatch > 0 && FunctionCall > Layout) {
+  if (getTotal("EventDispatch") > 0 && getTotal("FunctionCall") > getTotal("Layout")) {
     hints.push(
       "Heavy JS/event-handler cost. In Angular this often means scroll listeners, zone.js-triggered change detection, or repeated component work."
     );
   }
-  if (Layout > 0 || RecalculateStyles > 0) {
+  if (getTotal("Layout") > 0 || getTotal("RecalculateStyles") > 0) {
     hints.push(
       "Layout/style cost is significant. Look for forced reflow, getBoundingClientRect/offsetHeight/clientHeight reads after DOM writes, sticky/fixed elements, or large DOM."
     );
   }
-  if (Paint > 0) {
+  if (getTotal("Paint") > 0) {
     hints.push(
       "Paint cost is visible. Check paint flashing, large repaints, box-shadows, blur/backdrop-filter, gradients, and large images."
     );
   }
-  if (EventDispatch > 0) {
+  if (getTotal("EventDispatch") > 0) {
     hints.push(
       "EventDispatch shows user/input handling overhead. For scroll jank, inspect wheel/scroll/touchmove handlers and whether they trigger Angular change detection."
     );
@@ -231,22 +321,39 @@ function computeHints({ EventDispatch, FunctionCall, Layout, RecalculateStyles, 
   return hints;
 }
 
-// ---------- TEXT output ----------
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+function fmtMs(us) {
+  return (us / 1000).toFixed(2).padStart(10);
+}
+
+const HEADER = `${"count".padStart(7)}  ${"total ms".padStart(10)}  ${"self ms".padStart(10)}  ${"max ms".padStart(10)}  name`;
+
+function fmtRow(name, s) {
+  return `${String(s.count).padStart(7)}  ${fmtMs(s.total)} ms  ${fmtMs(s.self)} ms  ${fmtMs(s.max)} ms  ${name}`;
+}
+
+function topEntries(map, limit) {
+  return [...map.entries()].sort((a, b) => b[1].total - a[1].total).slice(0, limit);
+}
+
+// ── TEXT output ───────────────────────────────────────────────────────────────
+
+function printTop(title, map, limit) {
+  console.log(`\n=== ${title} ===`);
+  const sorted = topEntries(map, limit);
+  if (!sorted.length) {
+    console.log("(none)");
+    return;
+  }
+  console.log(HEADER);
+  for (const [name, s] of sorted) {
+    console.log(fmtRow(name, s));
+  }
+}
 
 function printTextReport(file, result, topN) {
   const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
-
-  function printTop(title, map, limit) {
-    console.log(`\n=== ${title} ===`);
-    const sorted = topEntries(map, limit);
-    if (!sorted.length) {
-      console.log("(none)");
-      return;
-    }
-    for (const [name, dur] of sorted) {
-      console.log(`${fmt(dur)}  ${name}`);
-    }
-  }
 
   printTop("Top trace events by CPU time", byEventName, topN);
   printTop("Top JS call frames / URLs", byCallFrame, topN);
@@ -254,11 +361,12 @@ function printTextReport(file, result, topN) {
   printTop("Scroll / rendering related", scrollRelated, topN);
 
   console.log("\n=== Important rendering buckets ===");
+  console.log(HEADER);
   let anyBucket = false;
   for (const key of INTERESTING) {
-    const value = renderingBuckets[key];
-    if (value > 0) {
-      console.log(`${fmt(value)}  ${key}`);
+    const s = renderingBuckets[key];
+    if (s && s.total > 0) {
+      console.log(fmtRow(key, s));
       anyBucket = true;
     }
   }
@@ -284,15 +392,24 @@ function printTextReport(file, result, topN) {
   }
 }
 
-// ---------- JSON output ----------
+// ── JSON output ───────────────────────────────────────────────────────────────
+
+function statsToObj(s) {
+  return {
+    count: s.count,
+    totalMs: parseFloat((s.total / 1000).toFixed(3)),
+    selfMs: parseFloat((s.self / 1000).toFixed(3)),
+    maxMs: parseFloat((s.max / 1000).toFixed(3)),
+  };
+}
 
 function buildJsonReport(file, result, topN) {
   const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
 
   function toList(map, key) {
-    return topEntries(map, topN).map(([name, durationMs]) => ({
+    return topEntries(map, topN).map(([name, s]) => ({
       [key]: name,
-      durationMs: parseFloat(durationMs.toFixed(3)),
+      ...statsToObj(s),
     }));
   }
 
@@ -304,7 +421,7 @@ function buildJsonReport(file, result, topN) {
     topCategories: toList(byCategory, "category"),
     scrollRelated: toList(scrollRelated, "name"),
     renderingBuckets: Object.fromEntries(
-      Object.entries(renderingBuckets).map(([k, v]) => [k, parseFloat(v.toFixed(3))])
+      Object.entries(renderingBuckets).map(([k, s]) => [k, statsToObj(s)])
     ),
     jankSummary,
     heuristicHints,
@@ -315,7 +432,7 @@ function printJsonReport(file, result, topN) {
   console.log(JSON.stringify(buildJsonReport(file, result, topN), null, 2));
 }
 
-// ---------- CSV output ----------
+// ── CSV output ────────────────────────────────────────────────────────────────
 
 function csvEscape(value) {
   const str = String(value);
@@ -329,9 +446,10 @@ function printCsvReport(file, result, topN) {
 
   function csvSection(title, entries, col) {
     console.log(title);
-    console.log(`${col},durationMs`);
-    for (const [name, dur] of entries) {
-      console.log(`${csvEscape(name)},${dur.toFixed(3)}`);
+    console.log(`${col},count,totalMs,selfMs,maxMs`);
+    for (const [name, s] of entries) {
+      const o = statsToObj(s);
+      console.log(`${csvEscape(name)},${o.count},${o.totalMs},${o.selfMs},${o.maxMs}`);
     }
     console.log();
   }
@@ -342,10 +460,13 @@ function printCsvReport(file, result, topN) {
   csvSection("scrollRelated", topEntries(scrollRelated, topN), "name");
 
   console.log("renderingBuckets");
-  console.log("name,durationMs");
+  console.log("name,count,totalMs,selfMs,maxMs");
   for (const key of INTERESTING) {
-    const value = renderingBuckets[key];
-    if (value > 0) console.log(`${key},${value.toFixed(3)}`);
+    const s = renderingBuckets[key];
+    if (s && s.total > 0) {
+      const o = statsToObj(s);
+      console.log(`${key},${o.count},${o.totalMs},${o.selfMs},${o.maxMs}`);
+    }
   }
   console.log();
 
@@ -365,44 +486,49 @@ function printCsvReport(file, result, topN) {
   }
 }
 
-// ---------- Compare mode ----------
+// ── Compare mode ──────────────────────────────────────────────────────────────
 
 /**
- * Diff two Maps, returning entries sorted by absolute delta.
+ * Diff two stats Maps by total wall time, returning entries sorted by |delta|.
  */
-function diffMaps(mapA, mapB, topN) {
+function diffMaps(mapA, mapB, limit) {
   const keys = new Set([...mapA.keys(), ...mapB.keys()]);
   const rows = [];
   for (const key of keys) {
-    const a = mapA.get(key) || 0;
-    const b = mapB.get(key) || 0;
+    const sa = mapA.get(key) || makeStats();
+    const sb = mapB.get(key) || makeStats();
+    const a = sa.total / 1000; // µs → ms
+    const b = sb.total / 1000;
     if (a === 0 && b === 0) continue;
     const deltaMs = b - a;
     const pctChange = a > 0 ? parseFloat((((b - a) / a) * 100).toFixed(1)) : null;
     rows.push({
       name: key,
-      durationMsA: parseFloat(a.toFixed(3)),
-      durationMsB: parseFloat(b.toFixed(3)),
+      totalMsA: parseFloat(a.toFixed(3)),
+      totalMsB: parseFloat(b.toFixed(3)),
       deltaMs: parseFloat(deltaMs.toFixed(3)),
       pctChange,
     });
   }
-  return rows.sort((a, b) => Math.abs(b.deltaMs) - Math.abs(a.deltaMs)).slice(0, topN);
+  return rows.sort((a, b) => Math.abs(b.deltaMs) - Math.abs(a.deltaMs)).slice(0, limit);
 }
 
 /**
  * Build a comparison object from two analysis results.
  */
 function buildComparison(resultA, resultB, topN) {
+  // Build stats maps for rendering buckets so diffMaps can work on them.
+  const renderingA = new Map(
+    Object.entries(resultA.renderingBuckets).map(([k, s]) => [k, s])
+  );
+  const renderingB = new Map(
+    Object.entries(resultB.renderingBuckets).map(([k, s]) => [k, s])
+  );
   return {
     topEventsByTime: diffMaps(resultA.byEventName, resultB.byEventName, topN),
     topCallFrames: diffMaps(resultA.byCallFrame, resultB.byCallFrame, topN),
     topCategories: diffMaps(resultA.byCategory, resultB.byCategory, topN),
-    renderingBuckets: diffMaps(
-      new Map(Object.entries(resultA.renderingBuckets)),
-      new Map(Object.entries(resultB.renderingBuckets)),
-      INTERESTING.length
-    ),
+    renderingBuckets: diffMaps(renderingA, renderingB, INTERESTING.length),
     jankSummaryA: resultA.jankSummary,
     jankSummaryB: resultB.jankSummary,
   };
@@ -418,7 +544,8 @@ function printTextCompare(fileA, fileB, comparison) {
     for (const e of entries) {
       const sign = e.deltaMs >= 0 ? "+" : "";
       const pct = e.pctChange !== null ? ` (${sign}${e.pctChange}%)` : " (new)";
-      console.log(`${fmt(e.deltaMs)}${pct}  ${e.name}`);
+      const deltaStr = `${e.deltaMs >= 0 ? "+" : ""}${e.deltaMs.toFixed(2).padStart(10)} ms`;
+      console.log(`${deltaStr}${pct}  ${e.name}`);
     }
   }
 
@@ -448,10 +575,10 @@ function printJsonCompare(fileA, fileB, comparison, topN) {
 function printCsvCompare(fileA, fileB, comparison) {
   function csvDiff(title, entries) {
     console.log(title);
-    console.log("name,durationMsA,durationMsB,deltaMs,pctChange");
+    console.log("name,totalMsA,totalMsB,deltaMs,pctChange");
     for (const e of entries) {
       const pct = e.pctChange !== null ? e.pctChange : "";
-      console.log(`${csvEscape(e.name)},${e.durationMsA},${e.durationMsB},${e.deltaMs},${pct}`);
+      console.log(`${csvEscape(e.name)},${e.totalMsA},${e.totalMsB},${e.deltaMs},${pct}`);
     }
     console.log();
   }
@@ -472,21 +599,44 @@ function printCsvCompare(fileA, fileB, comparison) {
   console.log(`jankScore,${a.jankScore},${b.jankScore}`);
 }
 
-// ---------- Exports (used by tests) ----------
+// ── Load trace file ───────────────────────────────────────────────────────────
 
-if (typeof module !== "undefined") {
-  module.exports = { parseArgs, analyzeTrace, computeJankSummary, buildComparison, buildJsonReport };
+/* istanbul ignore next */
+function loadTrace(file) {
+  if (!fs.existsSync(file)) {
+    console.error(`File not found: ${file}`);
+    process.exit(1);
+  }
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  return Array.isArray(raw) ? raw : raw.traceEvents || [];
 }
 
-// ---------- Main ----------
+// ── Exports (used by tests) ───────────────────────────────────────────────────
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    parseArgs,
+    analyzeTrace,
+    computeJankSummary,
+    buildComparison,
+    buildJsonReport,
+  };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 /* istanbul ignore next */
 if (require.main === module) {
   const cliArgs = parseArgs(process.argv.slice(2));
-  const { format, top: topN } = cliArgs;
+  const { format, top: topN, mainThreadOnly, filterTid } = cliArgs;
 
   if (!["text", "json", "csv"].includes(format)) {
     console.error(`Unknown format: ${format}. Use --format text, json, or csv.`);
+    process.exit(1);
+  }
+
+  if (mainThreadOnly && filterTid !== null) {
+    console.error("--main-thread-only and --tid cannot be used together.");
     process.exit(1);
   }
 
@@ -498,8 +648,9 @@ if (require.main === module) {
       process.exit(1);
     }
     const [fileA, fileB] = cliArgs.files;
-    const resultA = analyzeTrace(loadTrace(fileA));
-    const resultB = analyzeTrace(loadTrace(fileB));
+    const opts = { mainThreadOnly, filterTid };
+    const resultA = analyzeTrace(loadTrace(fileA), opts);
+    const resultB = analyzeTrace(loadTrace(fileB), opts);
     const comparison = buildComparison(resultA, resultB, topN);
 
     if (format === "json") {
@@ -510,8 +661,29 @@ if (require.main === module) {
       printTextCompare(fileA, fileB, comparison);
     }
   } else {
+    if (mainThreadOnly) {
+      const raw = JSON.parse(fs.readFileSync(cliArgs.files[0] || "performance.json", "utf8"));
+      const events = Array.isArray(raw) ? raw : raw.traceEvents || [];
+      // Emit warning if no main thread found (matches original behaviour)
+      const threadNames = new Map();
+      for (const e of events) {
+        if (e.ph === "M" && e.name === "thread_name") {
+          const key = `${e.pid}:${e.tid}`;
+          if (e.args && e.args.name) threadNames.set(key, e.args.name);
+        }
+      }
+      const hasMain = [...threadNames.values()].some(
+        (n) => n === "CrRendererMain" || n === "main"
+      );
+      if (!hasMain) {
+        console.warn(
+          "Warning: --main-thread-only specified but no CrRendererMain/main thread found in trace; showing all threads."
+        );
+      }
+    }
+
     const file = cliArgs.files[0] || "performance.json";
-    const result = analyzeTrace(loadTrace(file));
+    const result = analyzeTrace(loadTrace(file), { mainThreadOnly, filterTid });
 
     if (format === "json") {
       printJsonReport(file, result, topN);

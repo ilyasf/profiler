@@ -4,21 +4,25 @@ const { parseArgs, analyzeTrace, computeJankSummary, buildComparison, buildJsonR
 
 // ---------- Fixtures ----------
 
-function makeEvent(overrides) {
+let _ts = 1000;
+
+function makeEvent(overrides = {}) {
+  const ts = _ts;
+  _ts += (overrides.dur || 10000) + 1000;
   return {
     ph: "X",
     name: "FunctionCall",
     cat: "devtools.timeline",
     dur: 10000, // 10 ms in microseconds
-    ts: 1000,
+    ts,
+    pid: 1,
+    tid: 1,
     args: {},
     ...overrides,
   };
 }
 
-function traceWith(events) {
-  return { traceEvents: events };
-}
+beforeEach(() => { _ts = 1000; });
 
 // ---------- parseArgs ----------
 
@@ -29,6 +33,8 @@ describe("parseArgs", () => {
     expect(args.top).toBe(30);
     expect(args.compare).toBe(false);
     expect(args.files).toEqual([]);
+    expect(args.mainThreadOnly).toBe(false);
+    expect(args.filterTid).toBeNull();
   });
 
   test("--format json", () => {
@@ -72,24 +78,35 @@ describe("parseArgs", () => {
     expect(args.compare).toBe(true);
     expect(args.format).toBe("json");
   });
+
+  test("--main-thread-only", () => {
+    expect(parseArgs(["--main-thread-only"]).mainThreadOnly).toBe(true);
+  });
+
+  test("--tid 123", () => {
+    expect(parseArgs(["--tid", "123"]).filterTid).toBe(123);
+  });
 });
 
 // ---------- analyzeTrace ----------
 
 describe("analyzeTrace", () => {
   test("ignores non-complete events", () => {
-    const events = [{ ph: "B", name: "FunctionCall", dur: 10000, cat: "v8", args: {} }];
+    const events = [{ ph: "B", name: "FunctionCall", dur: 10000, cat: "v8", args: {}, ts: 1000, pid: 1, tid: 1 }];
     const result = analyzeTrace(events);
     expect(result.byEventName.size).toBe(0);
   });
 
-  test("accumulates event durations", () => {
+  test("accumulates event total duration", () => {
     const events = [
-      makeEvent({ name: "Layout", cat: "devtools.timeline", dur: 5000 }),
-      makeEvent({ name: "Layout", cat: "devtools.timeline", dur: 3000 }),
+      makeEvent({ name: "Layout", dur: 5000 }),
+      makeEvent({ name: "Layout", dur: 3000 }),
     ];
     const result = analyzeTrace(events);
-    expect(result.byEventName.get("Layout")).toBeCloseTo(8, 1);
+    const stats = result.byEventName.get("Layout");
+    expect(stats).toBeTruthy();
+    expect(stats.total).toBe(8000); // µs
+    expect(stats.count).toBe(2);
   });
 
   test("accumulates categories", () => {
@@ -98,7 +115,7 @@ describe("analyzeTrace", () => {
       makeEvent({ cat: "v8", dur: 10000 }),
     ];
     const result = analyzeTrace(events);
-    expect(result.byCategory.get("v8")).toBeCloseTo(30, 1);
+    expect(result.byCategory.get("v8").total).toBe(30000);
   });
 
   test("extracts call frame from data.url + data.functionName", () => {
@@ -144,9 +161,9 @@ describe("analyzeTrace", () => {
       makeEvent({ name: "Paint", dur: 5000 }),
     ];
     const result = analyzeTrace(events);
-    expect(result.renderingBuckets.Layout).toBeCloseTo(15, 1);
-    expect(result.renderingBuckets.Paint).toBeCloseTo(5, 1);
-    expect(result.renderingBuckets.RasterTask).toBe(0);
+    expect(result.renderingBuckets.Layout.total).toBe(15000);
+    expect(result.renderingBuckets.Paint.total).toBe(5000);
+    expect(result.renderingBuckets.RasterTask.total).toBe(0);
   });
 
   test("heuristic hints triggered for layout cost", () => {
@@ -165,6 +182,41 @@ describe("analyzeTrace", () => {
     const events = [makeEvent({ name: "RunTask", dur: 50000 })];
     const result = analyzeTrace(events);
     expect(result.byEventName.has("RunTask")).toBe(true);
+  });
+
+  test("computes self time: child subtracted from parent", () => {
+    // Parent: ts=1000, dur=20000 → ends at 21000
+    // Child:  ts=5000, dur=5000  → ends at 10000 (inside parent)
+    const events = [
+      { ph: "X", name: "Parent", cat: "v8", dur: 20000, ts: 1000, pid: 1, tid: 1, args: {} },
+      { ph: "X", name: "Child",  cat: "v8", dur: 5000,  ts: 5000, pid: 1, tid: 1, args: {} },
+    ];
+    const result = analyzeTrace(events);
+    const parent = result.byEventName.get("Parent");
+    // self = total − child = 20000 − 5000 = 15000
+    expect(parent.self).toBe(15000);
+    expect(parent.total).toBe(20000);
+  });
+
+  test("--main-thread-only filters other threads", () => {
+    const events = [
+      { ph: "M", name: "thread_name", pid: 1, tid: 1, args: { name: "CrRendererMain" } },
+      { ph: "X", name: "MainTask",  cat: "v8", dur: 10000, ts: 1000, pid: 1, tid: 1, args: {} },
+      { ph: "X", name: "OtherTask", cat: "v8", dur: 10000, ts: 1000, pid: 1, tid: 2, args: {} },
+    ];
+    const result = analyzeTrace(events, { mainThreadOnly: true });
+    expect(result.byEventName.has("MainTask")).toBe(true);
+    expect(result.byEventName.has("OtherTask")).toBe(false);
+  });
+
+  test("--tid filters to specific thread", () => {
+    const events = [
+      { ph: "X", name: "TidTask",   cat: "v8", dur: 10000, ts: 1000, pid: 1, tid: 99, args: {} },
+      { ph: "X", name: "OtherTask", cat: "v8", dur: 10000, ts: 1000, pid: 1, tid: 2,  args: {} },
+    ];
+    const result = analyzeTrace(events, { filterTid: 99 });
+    expect(result.byEventName.has("TidTask")).toBe(true);
+    expect(result.byEventName.has("OtherTask")).toBe(false);
   });
 });
 
@@ -214,18 +266,25 @@ describe("computeJankSummary", () => {
 // ---------- buildComparison ----------
 
 describe("buildComparison", () => {
+  function makeStats(total) {
+    return { count: 1, total, self: total, max: total };
+  }
+
   function makeResult(eventMap, frameMs = []) {
-    const byEventName = new Map(Object.entries(eventMap));
+    const byEventName = new Map(
+      Object.entries(eventMap).map(([k, v]) => [k, makeStats(v * 1000)]) // ms → µs
+    );
+    const renderingBuckets = {};
+    for (const key of ["EventDispatch","FunctionCall","TimerFire","FireAnimationFrame",
+      "Layout","RecalculateStyles","UpdateLayoutTree","Paint","RasterTask","CompositeLayers"]) {
+      renderingBuckets[key] = byEventName.get(key) || { count: 0, total: 0, self: 0, max: 0 };
+    }
     return {
       byEventName,
       byCallFrame: new Map(),
       byCategory: new Map(),
       scrollRelated: new Map(),
-      renderingBuckets: Object.fromEntries(
-        ["EventDispatch", "FunctionCall", "TimerFire", "FireAnimationFrame",
-          "Layout", "RecalculateStyles", "UpdateLayoutTree", "Paint",
-          "RasterTask", "CompositeLayers"].map((k) => [k, byEventName.get(k) || 0])
-      ),
+      renderingBuckets,
       jankSummary: computeJankSummary(frameMs),
       heuristicHints: [],
     };
@@ -272,6 +331,14 @@ describe("buildComparison", () => {
     const cmp = buildComparison(rA, rB, 30);
     expect(cmp.topEventsByTime[0].name).toBe("B");
   });
+
+  test("skips entries where both traces have zero", () => {
+    const rA = makeResult({ Layout: 0 });
+    const rB = makeResult({ Layout: 0 });
+    const cmp = buildComparison(rA, rB, 30);
+    const entry = cmp.topEventsByTime.find((e) => e.name === "Layout");
+    expect(entry).toBeUndefined();
+  });
 });
 
 // ---------- buildJsonReport ----------
@@ -292,29 +359,38 @@ describe("buildJsonReport", () => {
     expect(report).toHaveProperty("heuristicHints");
   });
 
-  test("topEventsByTime entries have name + durationMs", () => {
+  test("topEventsByTime entries have name + stats fields", () => {
     const events = [makeEvent({ name: "Layout", dur: 15000 })];
     const result = analyzeTrace(events);
     const report = buildJsonReport("trace.json", result, 10);
-    expect(report.topEventsByTime[0]).toMatchObject({ name: "Layout", durationMs: expect.any(Number) });
+    expect(report.topEventsByTime[0]).toMatchObject({
+      name: "Layout",
+      count: expect.any(Number),
+      totalMs: expect.any(Number),
+      selfMs: expect.any(Number),
+      maxMs: expect.any(Number),
+    });
   });
 
-  test("topCallFrames entries have frame + durationMs", () => {
+  test("topCallFrames entries have frame + stats fields", () => {
     const events = [
       makeEvent({ args: { data: { functionName: "myFn", url: "http://example.com/app.js" } } }),
     ];
     const result = analyzeTrace(events);
     const report = buildJsonReport("trace.json", result, 10);
-    expect(report.topCallFrames[0]).toMatchObject({ frame: expect.any(String), durationMs: expect.any(Number) });
+    expect(report.topCallFrames[0]).toMatchObject({
+      frame: expect.any(String),
+      totalMs: expect.any(Number),
+    });
   });
 
-  test("topCategories entries have category + durationMs", () => {
+  test("topCategories entries have category + stats fields", () => {
     const events = [makeEvent({ cat: "devtools.timeline", dur: 5000 })];
     const result = analyzeTrace(events);
     const report = buildJsonReport("trace.json", result, 10);
     expect(report.topCategories[0]).toMatchObject({
       category: "devtools.timeline",
-      durationMs: expect.any(Number),
+      totalMs: expect.any(Number),
     });
   });
 
@@ -343,5 +419,17 @@ describe("buildJsonReport", () => {
     const result = analyzeTrace(events);
     const report = buildJsonReport("trace.json", result, 10);
     expect(() => JSON.stringify(report)).not.toThrow();
+  });
+
+  test("renderingBuckets has stats shape for each bucket key", () => {
+    const events = [makeEvent({ name: "Layout", dur: 10000 })];
+    const result = analyzeTrace(events);
+    const report = buildJsonReport("trace.json", result, 10);
+    expect(report.renderingBuckets.Layout).toMatchObject({
+      count: expect.any(Number),
+      totalMs: expect.any(Number),
+      selfMs: expect.any(Number),
+      maxMs: expect.any(Number),
+    });
   });
 });
