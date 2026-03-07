@@ -1,6 +1,6 @@
 "use strict";
 
-const { parseArgs, analyzeTrace, computeJankSummary, buildComparison, buildJsonReport } = require("./index");
+const { parseArgs, analyzeTrace, computeJankSummary, buildComparison, buildJsonReport, buildCsvReport, buildCsvCompare } = require("./index");
 
 // ---------- Fixtures ----------
 
@@ -431,5 +431,141 @@ describe("buildJsonReport", () => {
       selfMs: expect.any(Number),
       maxMs: expect.any(Number),
     });
+  });
+});
+
+// ---------- buildCsvReport ----------
+
+describe("buildCsvReport", () => {
+  test("first row is the single normalized header", () => {
+    const result = analyzeTrace([makeEvent({ name: "Layout", dur: 15000 })]);
+    const rows = buildCsvReport("t.json", result, 10);
+    expect(rows[0]).toBe("section,name,count,totalMs,selfMs,maxMs");
+  });
+
+  test("stats rows carry the section column and all four metrics", () => {
+    const result = analyzeTrace([makeEvent({ name: "Layout", dur: 15000 })]);
+    const rows = buildCsvReport("t.json", result, 10);
+    const row = rows.find((r) => r.startsWith("topEventsByTime,") && r.includes("Layout"));
+    expect(row).toBeTruthy();
+    const cols = row.split(",");
+    expect(cols).toHaveLength(6); // section,name,count,totalMs,selfMs,maxMs
+    expect(Number(cols[2])).toBeGreaterThanOrEqual(1); // count
+    expect(Number(cols[3])).toBeGreaterThan(0);        // totalMs
+    expect(Number(cols[4])).toBeGreaterThanOrEqual(0); // selfMs
+    expect(Number(cols[5])).toBeGreaterThan(0);        // maxMs
+  });
+
+  test("all sections (topCallFrames, topCategories, scrollRelated) use the section column", () => {
+    const events = [
+      makeEvent({ name: "ScrollBegin", cat: "input",
+        args: { data: { functionName: "fn", url: "http://example.com/a.js" } } }),
+    ];
+    const result = analyzeTrace(events);
+    const rows = buildCsvReport("t.json", result, 10);
+    expect(rows.some((r) => r.startsWith("topCallFrames,"))).toBe(true);
+    expect(rows.some((r) => r.startsWith("topCategories,"))).toBe(true);
+    expect(rows.some((r) => r.startsWith("scrollRelated,"))).toBe(true);
+  });
+
+  test("jankSummary metrics each have their own row with integer value in count column", () => {
+    const result = analyzeTrace([makeEvent({ name: "DrawFrame", dur: 25000 })]);
+    const rows = buildCsvReport("t.json", result, 10);
+    const jankRow = rows.find((r) => r.startsWith("jankSummary,totalFrames,"));
+    expect(jankRow).toBeTruthy();
+    expect(jankRow.split(",")[2]).toBe("1"); // count = totalFrames value = 1
+  });
+
+  test("worstFrames each get their own jankWorstFrames row (no variable-length worstFramesMs row)", () => {
+    const events = [
+      makeEvent({ name: "DrawFrame", dur: 30000 }),
+      makeEvent({ name: "DrawFrame", dur: 20000 }),
+    ];
+    const result = analyzeTrace(events);
+    const rows = buildCsvReport("t.json", result, 10);
+    const worstRows = rows.filter((r) => r.startsWith("jankWorstFrames,"));
+    expect(worstRows).toHaveLength(2);
+    // rank 1 is the slower frame; duration in totalMs column (index 3)
+    const rank1 = worstRows.find((r) => r.startsWith("jankWorstFrames,1,"));
+    expect(rank1).toBeTruthy();
+    expect(Number(rank1.split(",")[3])).toBeCloseTo(30, 0);
+  });
+
+  test("heuristicHints each get their own heuristicHints row", () => {
+    const result = analyzeTrace([makeEvent({ name: "Layout", dur: 100000 })]);
+    const rows = buildCsvReport("t.json", result, 10);
+    const hintRows = rows.filter((r) => r.startsWith("heuristicHints,"));
+    expect(hintRows.length).toBeGreaterThan(0);
+  });
+
+  test("no standalone section-title rows (every data row has 6 comma-separated fields)", () => {
+    const events = [
+      makeEvent({ name: "Layout", dur: 15000 }),
+      makeEvent({ name: "DrawFrame", dur: 25000 }),
+    ];
+    const result = analyzeTrace(events);
+    const rows = buildCsvReport("t.json", result, 10);
+    // Skip header; data rows that are pure stats (no quoted commas) must have 6 fields
+    for (const row of rows.slice(1)) {
+      if (row.startsWith("heuristicHints,")) continue; // hint text may contain commas
+      expect(row.split(",")).toHaveLength(6);
+    }
+  });
+});
+
+// ---------- buildCsvCompare ----------
+
+describe("buildCsvCompare", () => {
+  function makeResultForCsv(eventMap, frameMs = []) {
+    const byEventName = new Map(
+      Object.entries(eventMap).map(([k, v]) => [k, { count: 1, total: v * 1000, self: v * 1000, max: v * 1000 }])
+    );
+    const renderingBuckets = {};
+    for (const key of ["EventDispatch","FunctionCall","TimerFire","FireAnimationFrame",
+      "Layout","RecalculateStyles","UpdateLayoutTree","Paint","RasterTask","CompositeLayers"]) {
+      renderingBuckets[key] = byEventName.get(key) || { count: 0, total: 0, self: 0, max: 0 };
+    }
+    return { byEventName, byCallFrame: new Map(), byCategory: new Map(),
+      scrollRelated: new Map(), renderingBuckets,
+      jankSummary: computeJankSummary(frameMs), heuristicHints: [] };
+  }
+
+  test("first row is the normalized comparison header", () => {
+    const cmp = buildComparison(makeResultForCsv({}), makeResultForCsv({}), 10);
+    const rows = buildCsvCompare("a.json", "b.json", cmp);
+    expect(rows[0]).toBe(
+      "section,name,countA,totalMsA,selfMsA,maxMsA,countB,totalMsB,selfMsB,maxMsB,deltaTotalMs,pctChange"
+    );
+  });
+
+  test("diff rows include full per-trace metrics (count, self, max) for both traces", () => {
+    const rA = makeResultForCsv({ Layout: 100 });
+    const rB = makeResultForCsv({ Layout: 150 });
+    const cmp = buildComparison(rA, rB, 10);
+    const rows = buildCsvCompare("a.json", "b.json", cmp);
+    const row = rows.find((r) => r.startsWith("topEventsByTime,") && r.includes("Layout"));
+    expect(row).toBeTruthy();
+    const cols = row.split(",");
+    expect(cols).toHaveLength(12);
+    expect(Number(cols[2])).toBeGreaterThanOrEqual(1);  // countA
+    expect(Number(cols[3])).toBeCloseTo(100, 1);        // totalMsA
+    expect(Number(cols[4])).toBeGreaterThanOrEqual(0);  // selfMsA
+    expect(Number(cols[5])).toBeGreaterThan(0);         // maxMsA
+    expect(Number(cols[6])).toBeGreaterThanOrEqual(1);  // countB
+    expect(Number(cols[7])).toBeCloseTo(150, 1);        // totalMsB
+    expect(Number(cols[10])).toBeCloseTo(50, 1);        // deltaTotalMs
+  });
+
+  test("jankSummaryComparison rows use countA and countB for integer values", () => {
+    const rA = makeResultForCsv({}, [20, 60]);
+    const rB = makeResultForCsv({}, [10]);
+    const cmp = buildComparison(rA, rB, 10);
+    const rows = buildCsvCompare("a.json", "b.json", cmp);
+    const jankRow = rows.find((r) => r.startsWith("jankSummaryComparison,totalFrames,"));
+    expect(jankRow).toBeTruthy();
+    const cols = jankRow.split(",");
+    expect(cols[2]).toBe("2"); // countA = totalFramesA = 2
+    expect(cols[6]).toBe("1"); // countB = totalFramesB = 1
+    expect(Number(cols[10])).toBe(-1); // deltaTotalMs = 1 - 2 = -1
   });
 });

@@ -441,55 +441,69 @@ function csvEscape(value) {
     : str;
 }
 
-function printCsvReport(file, result, topN) {
+/**
+ * Build a single normalized CSV from an analysis result.
+ *
+ * Schema: section,name,count,totalMs,selfMs,maxMs
+ *
+ * Sections emitted:
+ *   topEventsByTime  – top trace events by total CPU time
+ *   topCallFrames    – top JS call frames / URLs
+ *   topCategories    – top trace categories
+ *   scrollRelated    – scroll / rendering related events
+ *   renderingBuckets – key rendering-pipeline events
+ *   jankSummary      – one row per metric; integer value in the count column
+ *   jankWorstFrames  – one row per worst frame; duration in the totalMs column
+ *   heuristicHints   – one row per hint; text in the name column
+ *
+ * Returns an array of row strings (header first, no trailing newlines).
+ */
+function buildCsvReport(file, result, topN) {
   const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
+  const rows = ["section,name,count,totalMs,selfMs,maxMs"];
 
-  function csvSection(title, entries, col) {
-    console.log(title);
-    console.log(`${col},count,totalMs,selfMs,maxMs`);
-    for (const [name, s] of entries) {
-      const o = statsToObj(s);
-      console.log(`${csvEscape(name)},${o.count},${o.totalMs},${o.selfMs},${o.maxMs}`);
-    }
-    console.log();
+  function statsRow(section, name, s) {
+    const o = statsToObj(s);
+    rows.push(`${section},${csvEscape(name)},${o.count},${o.totalMs},${o.selfMs},${o.maxMs}`);
   }
 
-  csvSection("topEventsByTime", topEntries(byEventName, topN), "name");
-  csvSection("topCallFrames", topEntries(byCallFrame, topN), "frame");
-  csvSection("topCategories", topEntries(byCategory, topN), "category");
-  csvSection("scrollRelated", topEntries(scrollRelated, topN), "name");
-
-  console.log("renderingBuckets");
-  console.log("name,count,totalMs,selfMs,maxMs");
+  for (const [name, s] of topEntries(byEventName, topN)) statsRow("topEventsByTime", name, s);
+  for (const [name, s] of topEntries(byCallFrame, topN)) statsRow("topCallFrames", name, s);
+  for (const [name, s] of topEntries(byCategory, topN)) statsRow("topCategories", name, s);
+  for (const [name, s] of topEntries(scrollRelated, topN)) statsRow("scrollRelated", name, s);
   for (const key of INTERESTING) {
     const s = renderingBuckets[key];
-    if (s && s.total > 0) {
-      const o = statsToObj(s);
-      console.log(`${key},${o.count},${o.totalMs},${o.selfMs},${o.maxMs}`);
-    }
+    if (s && s.total > 0) statsRow("renderingBuckets", key, s);
   }
-  console.log();
 
-  console.log("jankSummary");
-  console.log(`totalFrames,${jankSummary.totalFrames}`);
-  console.log(`framesOver16ms,${jankSummary.framesOver16ms}`);
-  console.log(`framesOver50ms,${jankSummary.framesOver50ms}`);
-  console.log(`framesOver100ms,${jankSummary.framesOver100ms}`);
-  console.log(`worstFramesMs,${csvEscape(jankSummary.worstFramesMs.join(","))}`);
-  console.log(`jankScore,${jankSummary.jankScore}`);
-  console.log();
+  // jankSummary: one row per metric; integer value in the count column
+  for (const metric of ["totalFrames", "framesOver16ms", "framesOver50ms", "framesOver100ms", "jankScore"]) {
+    rows.push(`jankSummary,${metric},${jankSummary[metric]},,,`);
+  }
 
-  console.log("heuristicHints");
-  console.log("hint");
+  // jankWorstFrames: one row per frame; rank in name, duration in totalMs column
+  jankSummary.worstFramesMs.forEach((ms, i) => {
+    rows.push(`jankWorstFrames,${i + 1},,${ms},,`);
+  });
+
+  // heuristicHints: one row per hint; text in the name column
   for (const hint of heuristicHints) {
-    console.log(csvEscape(hint));
+    rows.push(`heuristicHints,${csvEscape(hint)},,,,`);
   }
+
+  return rows;
+}
+
+function printCsvReport(file, result, topN) {
+  console.log(buildCsvReport(file, result, topN).join("\n"));
 }
 
 // ── Compare mode ──────────────────────────────────────────────────────────────
 
 /**
  * Diff two stats Maps by total wall time, returning entries sorted by |delta|.
+ * Each entry carries the full metric set from both traces so callers have
+ * count, self time, and max duration available alongside the delta.
  */
 function diffMaps(mapA, mapB, limit) {
   const keys = new Set([...mapA.keys(), ...mapB.keys()]);
@@ -497,15 +511,21 @@ function diffMaps(mapA, mapB, limit) {
   for (const key of keys) {
     const sa = mapA.get(key) || makeStats();
     const sb = mapB.get(key) || makeStats();
-    const a = sa.total / 1000; // µs → ms
-    const b = sb.total / 1000;
-    if (a === 0 && b === 0) continue;
-    const deltaMs = b - a;
-    const pctChange = a > 0 ? parseFloat((((b - a) / a) * 100).toFixed(1)) : null;
+    const totalA = sa.total / 1000; // µs → ms
+    const totalB = sb.total / 1000;
+    if (totalA === 0 && totalB === 0) continue;
+    const deltaMs = totalB - totalA;
+    const pctChange = totalA > 0 ? parseFloat((((totalB - totalA) / totalA) * 100).toFixed(1)) : null;
     rows.push({
       name: key,
-      totalMsA: parseFloat(a.toFixed(3)),
-      totalMsB: parseFloat(b.toFixed(3)),
+      countA: sa.count,
+      totalMsA: parseFloat(totalA.toFixed(3)),
+      selfMsA: parseFloat((sa.self / 1000).toFixed(3)),
+      maxMsA: parseFloat((sa.max / 1000).toFixed(3)),
+      countB: sb.count,
+      totalMsB: parseFloat(totalB.toFixed(3)),
+      selfMsB: parseFloat((sb.self / 1000).toFixed(3)),
+      maxMsB: parseFloat((sb.max / 1000).toFixed(3)),
       deltaMs: parseFloat(deltaMs.toFixed(3)),
       pctChange,
     });
@@ -572,31 +592,50 @@ function printJsonCompare(fileA, fileB, comparison, topN) {
   console.log(JSON.stringify({ fileA, fileB, topN, comparison }, null, 2));
 }
 
-function printCsvCompare(fileA, fileB, comparison) {
-  function csvDiff(title, entries) {
-    console.log(title);
-    console.log("name,totalMsA,totalMsB,deltaMs,pctChange");
-    for (const e of entries) {
-      const pct = e.pctChange !== null ? e.pctChange : "";
-      console.log(`${csvEscape(e.name)},${e.totalMsA},${e.totalMsB},${e.deltaMs},${pct}`);
-    }
-    console.log();
+/**
+ * Build a single normalized comparison CSV.
+ *
+ * Schema: section,name,countA,totalMsA,selfMsA,maxMsA,countB,totalMsB,selfMsB,maxMsB,deltaTotalMs,pctChange
+ *
+ * Sections emitted:
+ *   topEventsByTime, topCallFrames, topCategories, renderingBuckets –
+ *     full per-trace metrics (count, total, self, max) plus delta and pct change.
+ *   jankSummaryComparison – one row per metric; integer values in countA/countB,
+ *     arithmetic delta in deltaTotalMs.
+ *
+ * Returns an array of row strings (header first, no trailing newlines).
+ */
+function buildCsvCompare(fileA, fileB, comparison) {
+  const rows = [
+    "section,name,countA,totalMsA,selfMsA,maxMsA,countB,totalMsB,selfMsB,maxMsB,deltaTotalMs,pctChange",
+  ];
+
+  function diffRow(section, e) {
+    const pct = e.pctChange !== null ? e.pctChange : "";
+    rows.push(
+      `${section},${csvEscape(e.name)},${e.countA},${e.totalMsA},${e.selfMsA},${e.maxMsA},` +
+      `${e.countB},${e.totalMsB},${e.selfMsB},${e.maxMsB},${e.deltaMs},${pct}`
+    );
   }
 
-  csvDiff("topEventsByTime", comparison.topEventsByTime);
-  csvDiff("topCallFrames", comparison.topCallFrames);
-  csvDiff("topCategories", comparison.topCategories);
-  csvDiff("renderingBuckets", comparison.renderingBuckets);
+  for (const e of comparison.topEventsByTime) diffRow("topEventsByTime", e);
+  for (const e of comparison.topCallFrames) diffRow("topCallFrames", e);
+  for (const e of comparison.topCategories) diffRow("topCategories", e);
+  for (const e of comparison.renderingBuckets) diffRow("renderingBuckets", e);
 
+  // jankSummaryComparison: countA/countB hold the integer values; deltaTotalMs holds the delta
   const a = comparison.jankSummaryA;
   const b = comparison.jankSummaryB;
-  console.log("jankSummaryComparison");
-  console.log("metric,valueA,valueB");
-  console.log(`totalFrames,${a.totalFrames},${b.totalFrames}`);
-  console.log(`framesOver16ms,${a.framesOver16ms},${b.framesOver16ms}`);
-  console.log(`framesOver50ms,${a.framesOver50ms},${b.framesOver50ms}`);
-  console.log(`framesOver100ms,${a.framesOver100ms},${b.framesOver100ms}`);
-  console.log(`jankScore,${a.jankScore},${b.jankScore}`);
+  for (const metric of ["totalFrames", "framesOver16ms", "framesOver50ms", "framesOver100ms", "jankScore"]) {
+    const delta = b[metric] - a[metric];
+    rows.push(`jankSummaryComparison,${metric},${a[metric]},,,,${b[metric]},,,,${delta},`);
+  }
+
+  return rows;
+}
+
+function printCsvCompare(fileA, fileB, comparison) {
+  console.log(buildCsvCompare(fileA, fileB, comparison).join("\n"));
 }
 
 // ── Load trace file ───────────────────────────────────────────────────────────
@@ -620,6 +659,8 @@ if (typeof module !== "undefined") {
     computeJankSummary,
     buildComparison,
     buildJsonReport,
+    buildCsvReport,
+    buildCsvCompare,
   };
 }
 
