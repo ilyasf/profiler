@@ -32,6 +32,21 @@ Flags and positional arguments can be combined in any order:
 node index.js ./example-trace.json 20 --main-thread-only
 ```
 
+### Output formats
+
+```bash
+node index.js trace.json --format json   # machine-readable JSON
+node index.js trace.json --format csv    # labelled CSV blocks per section
+node index.js trace.json                 # default human-readable text
+```
+
+### Compare two traces
+
+```bash
+node index.js compare trace-a.json trace-b.json
+node index.js compare trace-a.json trace-b.json --format json --top 20
+```
+
 ## What it does
 
 This tool parses Chrome performance trace JSON files and provides:
@@ -41,6 +56,7 @@ This tool parses Chrome performance trace JSON files and provides:
 - **Top categories** - Groups events by their trace categories
 - **Scroll / rendering related events** - Filters events that may impact scroll performance
 - **Important rendering buckets** - Key metrics for layout, paint, and composite operations
+- **Frame / jank summary** - Counts frames exceeding 16.6 ms / 50 ms / 100 ms thresholds and computes a weighted jank score
 - **Heuristic hints** - Automated suggestions for common performance issues
 
 ### Self-time vs total time
@@ -64,6 +80,18 @@ Self-time is computed per-thread using a stack-based algorithm that handles arbi
 | `--tid <n>` | Include only events from thread with the given numeric ID |
 
 If `--main-thread-only` is specified but no `CrRendererMain`/`main` thread is found in the trace, a warning is printed and all threads are shown.
+
+### Frame / jank summary
+
+Aggregates `DrawFrame`, `BeginFrame`, and `ActivateLayerTree` events:
+
+- Frame counts exceeding 16.6 ms / 50 ms / 100 ms thresholds
+- Top-5 worst frame times
+- Weighted jank score: mild frame +1, moderate +3, severe +10
+
+### Compare mode
+
+Diffs event/call-frame/category/rendering-bucket maps between two traces — absolute delta in ms, percentage change, `(new)` for events absent in trace A. Jank score delta is labelled `regression` / `improvement` / `no change`.
 
 ## Generating a trace file
 
@@ -89,6 +117,14 @@ of that time is attributed to `FunctionCall` children, not `RunTask` itself).
       3     3235.56 ms      802.11 ms     1420.33 ms  FunctionCall
     ...
 
+=== Frame / jank summary ===
+  Total frames :  42
+  Over 16.6 ms :  8
+  Over  50 ms  :  2
+  Over 100 ms  :  0
+  Worst frames :  87.34 ms  63.12 ms  48.90 ms  32.11 ms  28.05 ms
+  Jank score   :  14
+
 === Heuristic hints ===
 - Heavy JS/event-handler cost. In Angular this often means scroll listeners,
   zone.js-triggered change detection, or repeated component work.
@@ -107,3 +143,4 @@ of that time is attributed to `FunctionCall` children, not `RunTask` itself).
 
 ## Example output
 <img width="859" height="883" alt="image" src="https://github.com/user-attachments/assets/e2be54b4-60fe-4d63-a89d-3ec17bef6530" />
+
