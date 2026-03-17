@@ -22,6 +22,31 @@ const INTERESTING = [
 /** Chrome trace event names that carry per-frame timing information. */
 const FRAME_EVENT_NAMES = new Set(["DrawFrame", "BeginFrame", "ActivateLayerTree"]);
 
+/**
+ * Property/method names whose presence in a call-frame label indicates a
+ * synchronous layout-forcing read (forced reflow).
+ */
+const FORCED_REFLOW_PATTERNS = [
+  "getboundingclientrect",
+  "offsetheight",
+  "offsetwidth",
+  "offsettop",
+  "offsetleft",
+  "offsetparent",
+  "clientheight",
+  "clientwidth",
+  "clienttop",
+  "clientleft",
+  "scrolltop",
+  "scrollleft",
+  "scrollwidth",
+  "scrollheight",
+  "getcomputedstyle",
+  "innertext",
+  "scrollintoview",
+  "focus",
+];
+
 // ── CLI argument parsing ──────────────────────────────────────────────────────
 
 /**
@@ -184,6 +209,11 @@ function analyzeTrace(events, { mainThreadOnly = false, filterTid = null } = {})
   const scrollRelated = new Map();
   const frameDurationsMs = [];
 
+  // Angular / zone.js detection
+  let zoneDetected = false;
+  // Forced-reflow call-site tracking (frameLabel → accumulated total µs)
+  const forcedReflowFrames = new Map();
+
   for (const e of completeEvents) {
     const totalUs = e.dur || 0;
     const selfUs = selfTimeMap.get(e) ?? totalUs;
@@ -210,7 +240,26 @@ function analyzeTrace(events, { mainThreadOnly = false, filterTid = null } = {})
       frameLabel = String(frame);
     }
 
-    if (frameLabel) addStats(byCallFrame, frameLabel, totalUs, selfUs);
+    if (frameLabel) {
+      addStats(byCallFrame, frameLabel, totalUs, selfUs);
+
+      const labelLower = frameLabel.toLowerCase();
+
+      // Zone.js detection via call-frame URL
+      if (!zoneDetected && labelLower.includes("zone.js")) {
+        zoneDetected = true;
+      }
+
+      // Forced-reflow detection: accumulate duration for frames matching known
+      // layout-invalidating property/method reads
+      for (const pattern of FORCED_REFLOW_PATTERNS) {
+        if (labelLower.includes(pattern)) {
+          const prev = forcedReflowFrames.get(frameLabel) || 0;
+          forcedReflowFrames.set(frameLabel, prev + totalUs);
+          break;
+        }
+      }
+    }
 
     const lower =
       `${name} ${cat} ${JSON.stringify(args).slice(0, 1000)}`.toLowerCase();
@@ -241,7 +290,12 @@ function analyzeTrace(events, { mainThreadOnly = false, filterTid = null } = {})
   }
 
   const jankSummary = computeJankSummary(frameDurationsMs);
-  const heuristicHints = computeHints(renderingBuckets);
+  const { angularHints, layoutThrashHints } = computeHints(
+    renderingBuckets,
+    zoneDetected,
+    forcedReflowFrames
+  );
+  const heuristicHints = [...angularHints, ...layoutThrashHints];
 
   return {
     byEventName,
@@ -250,6 +304,8 @@ function analyzeTrace(events, { mainThreadOnly = false, filterTid = null } = {})
     scrollRelated,
     renderingBuckets,
     jankSummary,
+    angularHints,
+    layoutThrashHints,
     heuristicHints,
   };
 }
@@ -295,30 +351,126 @@ function computeJankSummary(frames) {
 
 // ── Heuristic hints ───────────────────────────────────────────────────────────
 
-function computeHints(renderingBuckets) {
+/** Threshold for "high frequency" layout/style events that suggests thrashing. */
+const LAYOUT_THRASH_COUNT_THRESHOLD = 50;
+
+/**
+ * Compute Angular-specific and layout-thrash hints from analysis results.
+ * @param {object} renderingBuckets - Key rendering-pipeline stats.
+ * @param {boolean} zoneDetected - Whether zone.js was detected in call frames.
+ * @param {Map<string,number>} forcedReflowFrames - Call frames with suspected forced-reflow reads, accumulated total µs.
+ * @returns {{ angularHints: string[], layoutThrashHints: string[] }}
+ */
+function computeHints(renderingBuckets, zoneDetected = false, forcedReflowFrames = new Map()) {
   const getTotal = (key) => (renderingBuckets[key] || makeStats()).total;
-  const hints = [];
-  if (getTotal("EventDispatch") > 0 && getTotal("FunctionCall") > getTotal("Layout")) {
-    hints.push(
-      "Heavy JS/event-handler cost. In Angular this often means scroll listeners, zone.js-triggered change detection, or repeated component work."
+  const getCount = (key) => (renderingBuckets[key] || makeStats()).count;
+  const fmtUs = (us) => `${(us / 1000).toFixed(2).padStart(10)} ms`;
+
+  // ── Angular hints ─────────────────────────────────────────────────────────
+  const angularHints = [];
+
+  if (zoneDetected) {
+    angularHints.push(
+      "zone.js detected in call frames. Every async operation (setTimeout, Promises, " +
+      "XHR, event listeners) triggers a full change-detection pass. " +
+      "Move work that does not need UI updates outside Angular's zone with " +
+      "NgZone.runOutsideAngular() to avoid unnecessary re-renders."
     );
   }
-  if (getTotal("Layout") > 0 || getTotal("RecalculateStyles") > 0) {
-    hints.push(
-      "Layout/style cost is significant. Look for forced reflow, getBoundingClientRect/offsetHeight/clientHeight reads after DOM writes, sticky/fixed elements, or large DOM."
-    );
-  }
-  if (getTotal("Paint") > 0) {
-    hints.push(
-      "Paint cost is visible. Check paint flashing, large repaints, box-shadows, blur/backdrop-filter, gradients, and large images."
-    );
-  }
+
   if (getTotal("EventDispatch") > 0) {
-    hints.push(
-      "EventDispatch shows user/input handling overhead. For scroll jank, inspect wheel/scroll/touchmove handlers and whether they trigger Angular change detection."
+    const edUs = getTotal("EventDispatch");
+    const fcUs = getTotal("FunctionCall");
+    const dispatchToCallRatio = fcUs > 0
+      ? (edUs / fcUs).toFixed(2)
+      : "N/A";
+    angularHints.push(
+      `EventDispatch → FunctionCall pattern: EventDispatch=${fmtUs(edUs)}, ` +
+      `FunctionCall=${fmtUs(fcUs)} (ratio ${dispatchToCallRatio}). ` +
+      "High EventDispatch cost means user/input events are directly driving expensive JS. " +
+      "In Angular: wrap scroll/mousemove/resize handlers with NgZone.runOutsideAngular() and " +
+      "manually call NgZone.run() only when the UI must update."
     );
   }
-  return hints;
+
+  if (getTotal("EventDispatch") > 0 && getTotal("FunctionCall") > getTotal("Layout")) {
+    angularHints.push(
+      "Heavy JS/event-handler cost detected (FunctionCall > Layout). " +
+      "Common Angular causes: zone.js-triggered change detection on every event, " +
+      "Default (CheckAlways) change-detection strategy on large component trees, " +
+      "or scroll/timer callbacks running inside the zone.\n" +
+      "  Suggestions:\n" +
+      "  • Switch leaf components to ChangeDetectionStrategy.OnPush.\n" +
+      "  • Wrap read-heavy scroll/resize handlers with NgZone.runOutsideAngular().\n" +
+      "  • Throttle or debounce high-frequency event streams (RxJS throttleTime / debounceTime).\n" +
+      "  • Use CDK virtual scrolling (<cdk-virtual-scroll-viewport>) for long lists."
+    );
+  }
+
+  // ── Layout-thrash hints ───────────────────────────────────────────────────
+  const layoutThrashHints = [];
+
+  const countLayout = getCount("Layout");
+  const countStyles = getCount("RecalculateStyles");
+
+  if (countLayout >= LAYOUT_THRASH_COUNT_THRESHOLD || countStyles >= LAYOUT_THRASH_COUNT_THRESHOLD) {
+    layoutThrashHints.push(
+      `High layout/style-recalculation frequency detected: ` +
+      `Layout×${countLayout}, RecalculateStyles×${countStyles}. ` +
+      "This often means a DOM read/write loop is forcing the browser to flush layout " +
+      "repeatedly (layout thrashing).\n" +
+      "  Suggestions:\n" +
+      "  • Batch all DOM reads first, then apply all DOM writes (e.g. use FastDOM).\n" +
+      "  • Replace synchronous reads like getBoundingClientRect() inside loops with " +
+      "values cached before the loop.\n" +
+      "  • Use ResizeObserver instead of polling offsetWidth/offsetHeight.\n" +
+      "  • Schedule write-heavy work in requestAnimationFrame callbacks."
+    );
+  } else if (getTotal("Layout") > 0 || getTotal("RecalculateStyles") > 0) {
+    layoutThrashHints.push(
+      "Layout/style cost is significant. Look for forced reflow, " +
+      "getBoundingClientRect/offsetHeight/clientHeight reads after DOM writes, " +
+      "sticky/fixed elements, or large DOM."
+    );
+  }
+
+  if (forcedReflowFrames.size > 0) {
+    const topReflow = [...forcedReflowFrames.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([frame, us]) => `  ${fmtUs(us)}  ${frame}`)
+      .join("\n");
+    layoutThrashHints.push(
+      "Likely forced-reflow call sites detected (property reads that flush layout):\n" +
+      topReflow + "\n" +
+      "  Move these reads before any DOM writes in the same frame to avoid " +
+      "synchronous layout. Reading a layout property after writing to the DOM forces " +
+      "the browser to recalculate layout immediately."
+    );
+  }
+
+  if (getTotal("Paint") > 0) {
+    layoutThrashHints.push(
+      "Paint cost is visible. Check paint flashing, large repaints, box-shadows, " +
+      "blur/backdrop-filter, gradients, and large images."
+    );
+  }
+
+  // Show basic EventDispatch hint only when zone.js was not detected (to avoid
+  // duplicating the more specific zone.js hint above) and layout thrashing is
+  // not the dominant issue already described.
+  const showBasicEventDispatchHint =
+    getTotal("EventDispatch") > 0 &&
+    !zoneDetected &&
+    countLayout < LAYOUT_THRASH_COUNT_THRESHOLD;
+  if (showBasicEventDispatchHint) {
+    layoutThrashHints.push(
+      "EventDispatch shows user/input handling overhead. For scroll jank, inspect " +
+      "wheel/scroll/touchmove handlers and whether they trigger Angular change detection."
+    );
+  }
+
+  return { angularHints, layoutThrashHints };
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -353,7 +505,7 @@ function printTop(title, map, limit) {
 }
 
 function printTextReport(file, result, topN) {
-  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
+  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, angularHints, layoutThrashHints } = result;
 
   printTop("Top trace events by CPU time", byEventName, topN);
   printTop("Top JS call frames / URLs", byCallFrame, topN);
@@ -384,11 +536,18 @@ function printTextReport(file, result, topN) {
     console.log(`  Jank score   :  ${jankSummary.jankScore}`);
   }
 
-  console.log("\n=== Heuristic hints ===");
-  if (!heuristicHints.length) {
+  console.log("\n=== Angular heuristics ===");
+  if (!angularHints.length) {
     console.log("(none)");
   } else {
-    for (const hint of heuristicHints) console.log(`- ${hint}`);
+    for (const hint of angularHints) console.log(`- ${hint}`);
+  }
+
+  console.log("\n=== Layout thrash hints ===");
+  if (!layoutThrashHints.length) {
+    console.log("(none)");
+  } else {
+    for (const hint of layoutThrashHints) console.log(`- ${hint}`);
   }
 }
 
@@ -404,7 +563,7 @@ function statsToObj(s) {
 }
 
 function buildJsonReport(file, result, topN) {
-  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
+  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, angularHints, layoutThrashHints, heuristicHints } = result;
 
   function toList(map, key) {
     return topEntries(map, topN).map(([name, s]) => ({
@@ -424,6 +583,8 @@ function buildJsonReport(file, result, topN) {
       Object.entries(renderingBuckets).map(([k, s]) => [k, statsToObj(s)])
     ),
     jankSummary,
+    angularHints,
+    layoutThrashHints,
     heuristicHints,
   };
 }
@@ -454,12 +615,14 @@ function csvEscape(value) {
  *   renderingBuckets – key rendering-pipeline events
  *   jankSummary      – one row per metric; integer value in the count column
  *   jankWorstFrames  – one row per worst frame; duration in the totalMs column
- *   heuristicHints   – one row per hint; text in the name column
+ *   angularHints     – one row per Angular-specific hint; text in the name column
+ *   layoutThrashHints – one row per layout-thrash hint; text in the name column
+ *   heuristicHints   – one row per hint (all hints combined); text in the name column
  *
  * Returns an array of row strings (header first, no trailing newlines).
  */
 function buildCsvReport(file, result, topN) {
-  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, heuristicHints } = result;
+  const { byEventName, byCallFrame, byCategory, scrollRelated, renderingBuckets, jankSummary, angularHints, layoutThrashHints, heuristicHints } = result;
   const rows = ["section,name,count,totalMs,selfMs,maxMs"];
 
   function statsRow(section, name, s) {
@@ -486,7 +649,15 @@ function buildCsvReport(file, result, topN) {
     rows.push(`jankWorstFrames,${i + 1},,${ms},,`);
   });
 
-  // heuristicHints: one row per hint; text in the name column
+  // angularHints / layoutThrashHints: one row per hint; text in the name column
+  for (const hint of angularHints) {
+    rows.push(`angularHints,${csvEscape(hint)},,,,`);
+  }
+  for (const hint of layoutThrashHints) {
+    rows.push(`layoutThrashHints,${csvEscape(hint)},,,,`);
+  }
+
+  // heuristicHints: combined list (backward compat)
   for (const hint of heuristicHints) {
     rows.push(`heuristicHints,${csvEscape(hint)},,,,`);
   }
@@ -657,6 +828,7 @@ if (typeof module !== "undefined") {
     parseArgs,
     analyzeTrace,
     computeJankSummary,
+    computeHints,
     buildComparison,
     buildJsonReport,
     buildCsvReport,

@@ -508,6 +508,8 @@ describe("buildCsvReport", () => {
     // Skip header; data rows that are pure stats (no quoted commas) must have 6 fields
     for (const row of rows.slice(1)) {
       if (row.startsWith("heuristicHints,")) continue; // hint text may contain commas
+      if (row.startsWith("angularHints,")) continue;   // hint text may contain commas
+      if (row.startsWith("layoutThrashHints,")) continue; // hint text may contain commas
       expect(row.split(",")).toHaveLength(6);
     }
   });
