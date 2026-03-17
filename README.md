@@ -109,49 +109,6 @@ Diffs event/call-frame/category/rendering-bucket maps between two traces — abs
 5. Stop recording
 6. Click "Save profile" to export as JSON
 
-## Example output
-
-The `self ms` column shows time spent *inside* the event excluding child events,
-which is often the most actionable metric (e.g. `RunTask` total is high but most
-of that time is attributed to `FunctionCall` children, not `RunTask` itself).
-
-```
-=== Top trace events by CPU time ===
-  count    total ms     self ms      max ms  name
-      1    10481.49 ms     4200.13 ms    10481.49 ms  RunTask
-      2     6452.81 ms     6452.81 ms     3301.50 ms  v8::Debugger::AsyncTaskRun
-      1     3238.99 ms     3238.99 ms     3238.99 ms  v8.callFunction
-      3     3235.56 ms      802.11 ms     1420.33 ms  FunctionCall
-    ...
-
-=== Frame / jank summary ===
-  Total frames :  42
-  Over 16.6 ms :  8
-  Over  50 ms  :  2
-  Over 100 ms  :  0
-  Worst frames :  87.34 ms  63.12 ms  48.90 ms  32.11 ms  28.05 ms
-  Jank score   :  14
-
-=== Angular heuristics ===
-- zone.js detected in call frames. Every async operation (setTimeout, Promises,
-  XHR, event listeners) triggers a full change-detection pass. Move work that
-  does not need UI updates outside Angular's zone with NgZone.runOutsideAngular().
-- EventDispatch → FunctionCall pattern: EventDispatch=    320.00 ms,
-  FunctionCall=   3235.56 ms (ratio 0.10). High EventDispatch cost means user/input
-  events are directly driving expensive JS.
-- Heavy JS/event-handler cost detected (FunctionCall > Layout).
-  Suggestions:
-  • Switch leaf components to ChangeDetectionStrategy.OnPush.
-  • Wrap read-heavy scroll/resize handlers with NgZone.runOutsideAngular().
-  • Throttle or debounce high-frequency event streams (RxJS throttleTime / debounceTime).
-  • Use CDK virtual scrolling (<cdk-virtual-scroll-viewport>) for long lists.
-
-=== Layout thrash hints ===
-- Layout/style cost is significant. Look for forced reflow,
-  getBoundingClientRect/offsetHeight/clientHeight reads after DOM writes,
-  sticky/fixed elements, or large DOM.
-```
-
 ## Use cases
 
 - Debugging scroll jank in Angular applications
@@ -160,16 +117,16 @@ of that time is attributed to `FunctionCall` children, not `RunTask` itself).
 - Analyzing paint and composite performance
 - Tracking down slow JavaScript execution
 
-## Screenshot
-### Top trace by CPU Time
+## Example ouput
+1. Top trace by CPU Time
 <img width="1877" height="759" alt="image" src="https://github.com/user-attachments/assets/e45fda05-67fe-4489-9c6e-a58f1d2cd6c0" />
-### Top JS call frames / URLs
+2. Top JS call frames / URLs
 <img width="1911" height="584" alt="image" src="https://github.com/user-attachments/assets/1827cb7d-06d8-4352-947b-49aa0d6f950f" />
-### Scroll / Rendering "costs"
+3. Scroll / Rendering "costs"
 <img width="1746" height="427" alt="image" src="https://github.com/user-attachments/assets/19a67e50-c4b7-4bb6-a4d0-3e304eefe229" />
-### Important rendering buckets
+4. Important rendering buckets
 <img width="1290" height="212" alt="image" src="https://github.com/user-attachments/assets/c585d534-4a5d-4fe7-9af2-42724998f9a2" />
-### Angular heuristics
+5. Angular heuristics
 <img width="2960" height="490" alt="image" src="https://github.com/user-attachments/assets/320ad325-9ab5-4f75-89b0-418d120f914f" />
 
 
