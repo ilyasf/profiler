@@ -161,5 +161,20 @@ of that time is attributed to `FunctionCall` children, not `RunTask` itself).
 - Tracking down slow JavaScript execution
 
 ## Screenshot
-<img width="859" height="883" alt="image" src="https://github.com/user-attachments/assets/e2be54b4-60fe-4d63-a89d-3ec17bef6530" />
+### Top trace by CPU Time
+<img width="1877" height="759" alt="image" src="https://github.com/user-attachments/assets/e45fda05-67fe-4489-9c6e-a58f1d2cd6c0" />
+### Top JS call frames / URLs
+<img width="1911" height="584" alt="image" src="https://github.com/user-attachments/assets/1827cb7d-06d8-4352-947b-49aa0d6f950f" />
+### Scroll / Rendering "costs"
+<img width="1746" height="427" alt="image" src="https://github.com/user-attachments/assets/19a67e50-c4b7-4bb6-a4d0-3e304eefe229" />
+### Important rendering buckets
+<img width="1290" height="212" alt="image" src="https://github.com/user-attachments/assets/c585d534-4a5d-4fe7-9af2-42724998f9a2" />
+### Angular heuristics
+<img width="2960" height="490" alt="image" src="https://github.com/user-attachments/assets/320ad325-9ab5-4f75-89b0-418d120f914f" />
+
+
+
+
+
+
 
